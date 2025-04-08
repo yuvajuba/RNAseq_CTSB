@@ -1,0 +1,1138 @@
+---
+title: "RNAseq analysis"
+subtitle: "Report for siCTSB vs siLuc"
+author: "juba"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    number_sections: no
+    toc: true
+    toc_depth: 6
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    highlight: "tango"
+    df_print: paged
+    fig_width: 7
+    fig_height: 6
+    code_folding: hide
+    # css: md_style.css
+    # runtime: shiny
+
+params:
+  c3m: true
+---
+
+```{r packages, include=FALSE, echo=FALSE, message=FALSE}
+
+library(DESeq2)
+library(edgeR)
+library(dplyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggsci)
+library(ggfortify)
+library(ggrepel)
+library(tidyr)
+library(writexl)
+library(readxl)
+library(umap)
+library(DT)
+library(limma)
+library(purrr)
+library(ggvenn)
+library(ComplexHeatmap)
+library(circlize)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(fgsea)
+library(enrichplot)
+library(shiny)
+library(EnhancedVolcano)
+library(forcats)
+
+## Palettes :
+MyPalette <- c("#9933aa","#ffdd22","#aa4400","#ff0000","#337722","#00ff66","#005566","#002277",
+               "#441144","#aa0077","#00bbff","#003333","#4422cc","#116611","#330077","#111111",
+               "#667700","#ddaa00","#33ffff","#ff22ff","#ffff33","#00ff00","#0000ff","#444444")
+```
+
+```{r functions, include=FALSE, echo=FALSE, message=FALSE}
+
+My_theme <- function(){
+  theme_minimal()+
+  theme(
+    # customize the plot title
+    plot.title = element_text(size = 15,
+                              colour = "darkred",
+                              face = "bold",
+                              hjust = 0.5,
+                              margin = margin(b = 12)),
+    plot.subtitle = element_text(size = 13,
+                                 colour = "black",
+                                 hjust = 0.5),
+    plot.background = element_rect(fill = "white",
+                                   colour = "white",
+                                   linewidth = 1),
+    
+    # customize the panels
+    panel.background = element_rect(colour = "black",
+                                    fill = "white",
+                                    linewidth = 1),
+    panel.grid = element_blank(),
+    
+    # customize axis
+    axis.title = element_text(size = 13,
+                              colour = "darkred",
+                              face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    axis.text = element_text(size = 12,
+                             colour = "black"),
+    
+    # customize legend
+    legend.title = element_text(size = 13,
+                                colour = "darkred",
+                                face = "bold",
+                                margin = margin(b = 10)),
+    legend.text = element_text(size = 12,
+                               colour = "black"),
+  )
+}
+
+Pre_process <- function(RCounts,
+                        Conditions,
+                        keep_above = 40,
+                        cpm_count_threshold = 0.5,
+                        apply_filt_samp = 4){
+  
+  rawcounts <- RCounts
+  Experimental <- Conditions
+  
+  # filtering the rawcounts :
+  raw_filt <- rawcounts %>% 
+    dplyr::mutate(M = apply(rawcounts, 1, max)) %>% 
+    dplyr::filter(M >= keep_above) %>% 
+    dplyr::select(-M)
+  
+  cpm_counts <- cpm(raw_filt)
+  raw_filt <- raw_filt[rowSums(cpm_counts > cpm_count_threshold) >= apply_filt_samp,]
+  
+  # normalizing the data :
+  dge <- DGEList(raw_filt)
+  dge <- calcNormFactors(dge, method = "TMM")
+  log_cpm <- cpm(dge, log = T, prior.count = 1) %>% as.data.frame()
+  
+  # MDS plot :
+  group <- factor(Experimental$Conditions)
+  mds <- plotMDS(dge,
+                 labels= colnames(log_cpm),
+                 col= as.numeric(group))
+  
+  # PCA plot :
+  pca <- prcomp(t(log_cpm), scale. = TRUE)
+  pca_plt <- autoplot(pca, 
+                      data = Experimental, 
+                      colour = "Replicate",
+                      shape = "Conditions",
+                      size = 5)+
+    labs(title = "PCA")+
+    My_theme()+
+    geom_hline(yintercept = 0, linetype = 2, color = "gray", linewidth = .5)+
+    geom_vline(xintercept = 0, linetype = 2, color = "gray", linewidth = .5)+
+    scale_colour_manual(values = MyPalette)
+  
+  
+  ## Regrouping the outputs :
+  Outs <- list(raw_filt = raw_filt,
+               dge = dge,
+               MDS_plt = mds,
+               PCA_plt = pca_plt)
+  
+  return(Outs)
+}
+
+My_violin <- function(df, 
+                      x= "log2FoldChange", 
+                      y= "padj", 
+                      lab= "Gene_name",
+                      point_size= 2,
+                      label_genes= F,
+                      lab_size= 3,
+                      lab_max_overlap= 20,
+                      lab_box.padding= 0.5,
+                      lab_colour = "navy", 
+                      lab_fill = "white", 
+                      lab_force_pull = .5,
+                      selected_genes= NULL,
+                      logFC_thresh= 1.5,
+                      padj_thresh= 1e-5,
+                      col_palette= NULL,
+                      extend_xlim= 0.5){
+  
+  if(!(is.data.frame(df))){
+    stop("your object isn't a dataframe !")
+  }
+  
+  if(!all(c(x, y) %in% colnames(df))){
+    stop(paste0("<",x,"> or <",y,"> isn't found in your dataframe !"))
+  }
+  
+  hline <- -log10(padj_thresh)
+  vline <- logFC_thresh
+  
+  ## Select genes :
+  if(is.null(selected_genes)){
+    selected_genes <- df %>% 
+      dplyr::filter(.data[[y]] < 1e-10,
+                    abs(.data[[x]]) > 2) %>% 
+      dplyr::pull(.data[[lab]])
+  }
+  
+  ## Color palette :
+  if(is.null(col_palette)){
+    col_palette <- c("pval & logFC"="darkred",
+                     "logFC"="darkgreen",
+                     "p-value"="midnightblue",
+                     "NS"="lightgray")
+  } else {
+    if(length(col_palette) < 4){
+      warning("The provided palette is of length < 4 ; therefor we're using default palette")
+      col_palette <- c("pval & logFC"="darkred",
+                       "logFC"="darkgreen",
+                       "p-value"="midnightblue",
+                       "NS"="lightgray")
+      
+    } else {
+      col_palette <- c("pval & logFC" = col_palette[1],
+                       "logFC" = col_palette[2],
+                       "p-value" = col_palette[3],
+                       "NS" = col_palette[4])
+    }
+  }
+  
+  
+  ## plot :
+  df %>% 
+    dplyr::mutate(Col = case_when(abs(.data[[x]]) > logFC_thresh & 
+                                    .data[[y]] < padj_thresh ~ "pval & logFC",
+                                  abs(.data[[x]]) > logFC_thresh & 
+                                    .data[[y]] > padj_thresh ~ "logFC",
+                                  abs(.data[[x]]) < logFC_thresh & 
+                                    .data[[y]] < padj_thresh ~ "p-value",
+                                  abs(.data[[x]]) < logFC_thresh & 
+                                    .data[[y]] > padj_thresh ~ "NS",
+                                  TRUE ~ "NS"),
+                  Sel_genes = ifelse(.data[[lab]] %in% selected_genes,
+                                     .data[[lab]],
+                                     NA)) -> df.plot
+  
+  
+  
+  if(isFALSE(label_genes)){
+    
+    plt <- df.plot %>% 
+      ggplot(aes(x= .data[[x]],
+                 y= -log10(.data[[y]])))+
+      geom_vline(xintercept = -(vline), linetype = 2, color = "black", linewidth = .4)+
+      geom_vline(xintercept = vline, linetype = 2, color = "black", linewidth = .4)+
+      geom_hline(yintercept = hline, linetype = 2, color = "black", linewidth = .4)+
+      geom_point(aes(colour = Col),
+                 size = point_size,
+                 alpha = 0.6)+
+      labs(title = "Volcano Plot",
+           caption = paste0("Number of genes : ", nrow(df)))+
+      theme(legend.position = "top",
+            legend.margin = margin(b=.05, unit = "in"),
+            legend.key = element_rect(colour = "white"),
+            panel.background = element_rect(fill = "white",
+                                            colour = "darkgray",
+                                            linewidth = .5),
+            legend.text = element_text(size = 13,
+                                       color = "black",
+                                       face = "bold"),
+            axis.title = element_text(size = 14,
+                                      face = "bold",
+                                      colour = "darkred"),
+            axis.title.x = element_text(margin = margin(t=12)),
+            axis.title.y = element_text(margin = margin(r=12)),
+            axis.text = element_text(size = 12,
+                                     colour = "black"),
+            plot.title = element_text(size = 16,
+                                      face = "bold",
+                                      colour = "darkred",
+                                      margin = margin(b=12)),
+            plot.caption = element_text(size = 13,
+                                        colour = "black"))+
+      guides(colour = guide_legend(title = NULL,
+                                   override.aes = list(size = 5)))+
+      scale_color_manual(values = col_palette)+
+      xlim(c((min(df[[x]]) - extend_xlim),(max(df[[x]]) + extend_xlim)))
+    
+  } else {
+    
+    plt <- df.plot %>% 
+      ggplot(aes(x= .data[[x]],
+                 y= -log10(.data[[y]])))+
+      geom_vline(xintercept = -(vline), linetype = 2, color = "black", linewidth = .4)+
+      geom_vline(xintercept = vline, linetype = 2, color = "black", linewidth = .4)+
+      geom_hline(yintercept = hline, linetype = 2, color = "black", linewidth = .4)+
+      geom_point(aes(colour = Col),
+                 size = point_size,
+                 alpha = 0.6)+
+      labs(title = "Volcano Plot",
+           caption = paste0("Number of genes : ", nrow(df)))+
+      theme(legend.position = "top",
+            legend.margin = margin(b=.05, unit = "in"),
+            legend.key = element_rect(colour = "white"),
+            panel.background = element_rect(fill = "white",
+                                            colour = "darkgray",
+                                            linewidth = .5),
+            legend.text = element_text(size = 13,
+                                       color = "black",
+                                       face = "bold"),
+            axis.title = element_text(size = 14,
+                                      face = "bold",
+                                      colour = "darkred"),
+            axis.title.x = element_text(margin = margin(t=12)),
+            axis.title.y = element_text(margin = margin(r=12)),
+            axis.text = element_text(size = 12,
+                                     colour = "black"),
+            plot.title = element_text(size = 16,
+                                      face = "bold",
+                                      colour = "darkred",
+                                      margin = margin(b=12)),
+            plot.caption = element_text(size = 13,
+                                        colour = "black"))+
+      guides(colour = guide_legend(title = NULL,
+                                   override.aes = list(size = 5)))+
+      scale_color_manual(values = col_palette)+
+      xlim(c((min(df[[x]]) - extend_xlim),(max(df[[x]]) + extend_xlim)))+
+      geom_label_repel(aes(label = .data[["Sel_genes"]]),
+                       size = lab_size,
+                       max.overlaps = lab_max_overlap, 
+                       box.padding = lab_box.padding,
+                       label.r = 0.4,
+                       label.size = .25, 
+                       force_pull = lab_force_pull,
+                       colour = lab_colour, 
+                       fill = lab_fill)
+    
+  }
+  
+  
+  return(plt)
+}
+
+My_heatmap <- function(counts_table,
+                       DEA_results,
+                       log_transform = T,
+                       logFC_col = "log2FoldChange",
+                       pval_col = "padj",
+                       genes_col = "Gene_name",
+                       list_genes = NULL,
+                       cond1 = "siC8",
+                       cond2 = "siLuc"){
+  
+  if(!(any(class(counts_table) %in% c("matrix", "data.frame")))){
+    stop("You need to provide a dataframe or a matrix object as a table of counts")
+  }
+  
+  if(!(any(class(DEA_results) %in% c("matrix", "data.frame")))){
+    stop("You need to provide a dataframe or a matrix object as the DEA results")
+  }
+  
+  if(!(all(c(logFC_col, pval_col, genes_col) %in% colnames(DEA_results)))){
+    stop("Some column doesn't exist in your DEA results ! please check you dataframe !")
+  }
+  
+  if(!("Rank" %in% colnames(DEA_results))){
+    
+    if(quantile(DEA_results[[pval_col]])[2] < 1e-20 & nrow(DEA_results) > 200){
+      DEA_results <- DEA_results %>% 
+      dplyr::mutate(Rank = case_when(DEA_results[[pval_col]] < 1e-30 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(1e-30))/20, 4),
+                                     DEA_results[[pval_col]] >= 1e-30 & DEA_results[[pval_col]] < 1e-15 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(1e-15))/20, 4),
+                                     DEA_results[[pval_col]] >= 1e-15 & DEA_results[[pval_col]] < 1e-10 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(1e-10))/20, 4),
+                                     DEA_results[[pval_col]] >= 1e-10 & DEA_results[[pval_col]] < 1e-05 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(1e-05))/20, 4),
+                                     DEA_results[[pval_col]] >= 1e-05 & DEA_results[[pval_col]] < 5e-02 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(DEA_results[[pval_col]]))/20, 4),
+                                     DEA_results[[pval_col]] >= 5e-02 & DEA_results[[pval_col]] < 0.5 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(0.25))/20, 4),
+                                     DEA_results[[pval_col]] >= 0.25 ~ 0)) %>% 
+      dplyr::arrange(desc(Rank))
+      
+    } else {
+      
+      DEA_results <- DEA_results %>% 
+      dplyr::mutate(Rank = case_when(DEA_results[[pval_col]] < 1e-20 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(1e-20))/20, 4),
+                                     DEA_results[[pval_col]] >= 1e-20 & DEA_results[[pval_col]] < 1e-05 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(1e-10))/20, 4),
+                                     DEA_results[[pval_col]] >= 1e-05 & DEA_results[[pval_col]] < 5e-02 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(DEA_results[[pval_col]]))/20, 4),
+                                     DEA_results[[pval_col]] >= 5e-02 & DEA_results[[pval_col]] < 0.5 ~ 
+                                       round(DEA_results[[logFC_col]]*(-log10(0.25))/20, 4),
+                                     DEA_results[[pval_col]] >= 0.25 ~ 0)) %>% 
+      dplyr::arrange(desc(Rank))
+    }
+    
+    
+  }
+  
+  if(!(all(rownames(DEA_results) %in% rownames(counts_table)))){
+    if("Geneid" %in% colnames(DEA_results)){
+      rownames(DEA_results) <- DEA_results[["Geneid"]]
+    }
+  }
+  
+  if(is.null(list_genes)){
+    list_genes <- c(head(DEA_results[[genes_col]],20), tail(DEA_results[[genes_col]],20)) %>% 
+      setNames(c(head(rownames(DEA_results),20), tail(rownames(DEA_results),20)))
+  } else {
+    list_genes <- list_genes %>% 
+      setNames(rownames(DEA_results)[which(DEA_results[[genes_col]] %in% list_genes)])
+  }
+  
+  
+  ### Heatmap1 :    ------------------------------------------------------------
+  if(isTRUE(log_transform)){
+    n_fact <- estimateSizeFactorsForMatrix(counts_table)
+    n_count <- sweep(counts_table, 2, n_fact, FUN="/")
+    n_count <- log10(n_count+1)
+    n_count <- n_count[names(list_genes),]
+    n_count <- t(apply(n_count,1,scale))
+    colnames(n_count) <- colnames(counts_table)
+  } else {
+    n_fact <- estimateSizeFactorsForMatrix(counts_table)
+    n_count <- sweep(counts_table, 2, n_fact, FUN="/")
+    n_count <- n_count[names(list_genes),]
+    n_count <- t(apply(n_count,1,scale))
+    colnames(n_count) <- colnames(counts_table)
+  }
+  
+  log_counts <- sweep(counts_table, 2, n_fact, FUN="/")
+  log_counts <- log10(log_counts+1)
+  log_counts <- log_counts[names(list_genes),]
+  
+  Cond <- as.factor(str_split_i(colnames(n_count),"_",1))
+  ColConditions <- setNames(c("purple","khaki4"), levels(Cond))
+  HAnnot <- HeatmapAnnotation(Condition = Cond,
+                              col = list(Condition = ColConditions),
+                              annotation_name_side = "left",
+                              show_annotation_name = F,
+                              show_legend = F,
+                              annotation_name_gp = list(fontsize = 10,
+                                                        col = "navy",
+                                                        fontface = "bold"))
+  
+  HAnnot2 <- HeatmapAnnotation(LogCounts = anno_boxplot(log_counts, 
+                                                        axis = TRUE, 
+                                                        gp = gpar(fill = "orange", col = "black"),
+                                                        height = unit(2, "cm")),
+                               annotation_name_side = "left",
+                               annotation_name_gp = gpar(fontsize = 9,
+                                                         col = "darkred",
+                                                         fontface = "bold"),
+                               annotation_name_rot = 90)
+  
+  annotation_legend_param = list(grid_height = unit(1.7,"cm"),
+                                 grid_width = unit(0.7,"cm"),
+                                 labels_gp = gpar(col = "navy",
+                                                  fontsize = 12),
+                                 title_gp = gpar(col = "navy",
+                                                 fontsize = 14,
+                                                 fontface = "bold"))
+  
+  
+  h1 <- Heatmap(n_count,
+                cluster_rows = F, 
+                bottom_annotation = HAnnot,
+                top_annotation = HAnnot2,
+                column_title = "Heatmap", 
+                column_title_gp = gpar(fontsize = 16, 
+                                       col = "darkred",
+                                       fontface = "bold"),
+                show_row_dend = F,
+                show_column_dend = F,
+                column_names_gp = gpar(col = "darkred", 
+                                       fontface = "bold",
+                                       fontsize = 11),
+                column_names_rot = 60,
+                column_labels = colnames(n_count),
+                row_labels = DEA_results[names(list_genes),genes_col],
+                name = "Z-score",
+                cluster_columns = F,
+                col = colorRamp2(c(-2,0,2), 
+                                 c("darkgreen","white","darkred")))
+  
+  
+  ### Heatmap2 :    ------------------------------------------------------------
+  logFC_mat <- as.matrix(DEA_results[names(list_genes),logFC_col])
+  colnames(logFC_mat) <- "LogFC"
+  rownames(logFC_mat) <- list_genes
+  
+  h2 <- Heatmap(logFC_mat, 
+                row_labels = rownames(logFC_mat),
+                cluster_rows = F, 
+                name = "Log2FC", 
+                col = colorRamp2(c(-4,0,4), 
+                                 c("gold","white","cadetblue")),
+                column_names_gp = gpar(col = "darkred", 
+                                       fontface = "bold",
+                                       fontsize = 11),
+                column_names_rot = 60,
+                cell_fun = function(j,i,x,y,w,h,col){
+                  val <- round(logFC_mat[i,j],2)
+                  grid.text(val, x=x, y=y,
+                            gp = gpar(fontsize = 8, 
+                                      col = "black", 
+                                      fontface = "bold"))
+                })
+  
+  
+  ### Heatmap3 :    ------------------------------------------------------------
+  LogExp <- as.matrix(data.frame(
+    Log_cond1 = apply(log_counts[,grep(cond1, colnames(log_counts), value = T)],1,mean),
+    Log_cond2 = apply(log_counts[,grep(cond2, colnames(log_counts), value = T)],1,mean)
+  ))
+  
+  colnames(LogExp) <- c(paste0("Log.",cond1), paste0("Log.",cond2))
+  
+  h3 <- Heatmap(LogExp, 
+                row_labels = rownames(LogExp),
+                cluster_rows = F, 
+                show_column_dend = F,
+                column_names_gp = gpar(col = "darkred", 
+                                       fontface = "bold",
+                                       fontsize = 11),
+                column_names_rot = 60,
+                name = "LogExp", 
+                col = colorRamp2(c(1,3,5), 
+                                 c("white","brown","midnightblue")),
+                cell_fun = function(j,i,x,y,w,h,col){
+                  val <- round(LogExp[i,j],2)
+                  grid.text(val, x=x, y=y,
+                            gp = gpar(fontsize = 8, 
+                                      col = ifelse(val > 3.5, "white","black"), 
+                                      fontface = "bold"))
+                })
+  
+  
+  
+  return(h3+h1+h2)
+}
+```
+
+```{r ,include=FALSE, echo=FALSE, message=FALSE}
+
+if(params$c3m){
+  out_fig <- "~/Bureau/Projects/RNAseq/CTSB/out_fig/"
+  out_obj <- "~/Bureau/Projects/RNAseq/CTSB/out_obj/"
+  data_dir <- "~/Bureau/Projects/RNAseq/CTSB/data/"
+} else {
+  out_fig <- "/Projects/Project_M2_RNAseq/out_fig/"
+  out_obj <- "/Projects/Project_M2_RNAseq/out_obj/"
+  data_dir <- "/Projects/Project_M2_RNAseq/data/"
+}
+
+knitr::opts_chunk$set(echo = F, message = F, warning = F, fig.width = 7, fig.height = 6 ,error = T)
+```
+
+# Importing the data {.tabset .tabset-fade}
+
+```{r import}
+rawcounts <- read_xlsx(paste0(data_dir,"rawcounts.xlsx")) %>% column_to_rownames(var = "ID")
+metadata <- read_xlsx(paste0(data_dir,"metadata.xlsx"))
+Experimental <- data.frame(row.names = colnames(rawcounts),
+                           Conditions = str_split_i(colnames(rawcounts), "_", 1),
+                           Replicate = str_split_i(colnames(rawcounts), "_", 2))
+```
+
+## RawCounts
+
+```{r ,rows.print=5}
+rawcounts
+```
+
+## Experimental conditions
+
+```{r ,rows.print=5}
+Experimental
+```
+
+## Metadata
+
+```{r ,rows.print=5}
+metadata
+```
+
+
+# Counts distribution
+
+```{r}
+rawcounts %>% 
+  pivot_longer(cols = colnames(rawcounts),
+               names_to = "Samples",
+               values_to = "Counts") %>% 
+  mutate(Conditions = str_split_i(Samples, "_", 1)) %>% 
+  ggplot()+
+  geom_bar(aes(x= Samples,
+               y= Counts/10^6,
+               fill= Conditions),
+           stat = "identity")+
+  scale_fill_manual(values = c("gold","brown"))+
+  My_theme()+
+  theme(axis.text.x = element_text(size = 13, angle = 25, margin = margin(t=10)),
+        axis.title.x = element_blank(),
+        legend.title = element_text(size = 12,
+                                  face = "bold",
+                                  colour = "darkred"),
+        legend.text = element_text(size = 10,
+                                   colour = "black"))+
+  labs(title = "Read Counts",
+       y = "Counts in million",
+       x = "")
+```
+
+Let's move further and run a dimensional reduction analysis to see if we also have any odd sample. __To do so, we need first to filter the data !__
+
+
+# Dim reduction analysis :
+
+- Filtering the data :
+
+```{r ,echo=TRUE}
+## Pre-process params :   ####
+##############################
+min_count <- 40
+cpm_thresh <- 0.5
+samples_apply <- 4
+```
+
+- MDS plot :
+
+```{r}
+PreProcess_res <- Pre_process(RCounts = rawcounts,
+                              Conditions = Experimental,
+                              keep_above = min_count,
+                              cpm_count_threshold = cpm_thresh,
+                              apply_filt_samp = samples_apply)
+```
+
+
+- PCA plot :
+
+```{r}
+PreProcess_res$PCA_plt
+```
+
+According to these plots, we may remove the n1 sample
+
+```{r ,echo=TRUE}
+Experimental <- Experimental[which(!(Experimental$Replicate %in% c("n1"))),]
+rawcounts <- rawcounts[,rownames(Experimental)]
+```
+
+And again, plotting the MDS plot :
+
+```{r ,echo=TRUE}
+PreProcess_res <- Pre_process(RCounts = rawcounts,
+                              Conditions = Experimental,
+                              keep_above = min_count,
+                              cpm_count_threshold = cpm_thresh,
+                              apply_filt_samp = 3)
+```
+
+
+And let's take a look at the filtered rawcounts :
+
+```{r}
+raw_filt <- PreProcess_res$raw_filt
+dge <- PreProcess_res$dge
+```
+
+```{r}
+raw_filt %>% datatable()
+```
+
+
+# DE Analysis  
+
+## Processing :
+
+We'll be using the DESeq2 package to identify differentially expressed genes (DEGs) between the siC8 and siLuc conditions.
+
+```{r}
+DESeqObj <- DESeqDataSetFromMatrix(countData = dge, 
+                                   colData = Experimental,
+                                   design = ~ Conditions)
+DESeqObj$Conditions <- relevel(DESeqObj$Conditions, ref = "siLuc")
+dds <- DESeq(DESeqObj)
+res <- results(dds, 
+               contrast =  c("Conditions","siCTSB","siLuc"),
+               alpha = 0.05) %>%
+  as.data.frame() %>% 
+  rownames_to_column(var = "ID") %>% 
+  inner_join(metadata[,c("ID","Gene.name")],by = "ID") %>% 
+  dplyr::filter(!(is.na(padj)))
+
+# removing genes with no p values from the filtered raw counts
+raw_filt <- raw_filt[res$ID,]
+```
+
+Below are the differentially expressed genes (DEGs) identified using the following thresholds: 
+
+```{r ,echo=TRUE}
+logfc_thresh <- 1
+pval_thresh <- 0.05
+```
+
+These criteria highlight genes that are both statistically significant and show a minimum two-fold change in expression between the siC8 and siLuc conditions.
+
+```{r}
+res_filt <- res %>% 
+  dplyr::filter(padj < pval_thresh,
+                abs(log2FoldChange) > logfc_thresh) %>% 
+  dplyr::select(ID, Gene.name, baseMean, log2FoldChange, padj) %>% 
+  dplyr::arrange(desc(log2FoldChange))
+```
+
+
+```{r}
+AllResults <- res  %>%  
+  dplyr::mutate(Log_baseMean = log10(baseMean),
+                Rank = case_when(padj < 1e-20 ~ 
+                                   round(log2FoldChange*(-log10(1e-20))/20, 4),
+                                 padj >= 1e-20 & padj < 1e-05 ~ 
+                                   round(log2FoldChange*(-log10(1e-10))/20, 4),
+                                 padj >= 1e-05 & padj < 5e-02 ~ 
+                                   round(log2FoldChange*(-log10(padj))/20, 4),
+                                 padj >= 5e-02 & padj < 0.5 ~ 
+                                   round(log2FoldChange*(-log10(0.25))/20, 4),
+                                 padj >= 0.25 ~ 0),
+                ENSEMBL = ID) %>% 
+  column_to_rownames(var = "ID") %>%
+  dplyr::arrange(desc(Rank)) %>%  
+  dplyr::select(ENSEMBL,Gene.name,baseMean,log2FoldChange,padj,Rank,Log_baseMean)
+
+AllResults <- merge(AllResults, raw_filt, by = 0) %>% 
+  column_to_rownames(var = "Row.names") %>% 
+  dplyr::arrange(desc(Rank))
+
+## Save :
+write_xlsx(AllResults, path = paste0(out_obj,"AllResults.xlsx"))
+```
+
+## Visualization :
+
+- MA plot : 
+
+```{r ,fig.width=8, fig.height=7}
+res %>% 
+  ggplot()+ 
+  geom_point(aes(x = log10(baseMean), 
+                 y = log2FoldChange,
+                 colour = abs(log2FoldChange)>1))+
+  geom_hline(yintercept = 1, linetype = 2, color = "black", linewidth = .6)+
+  geom_hline(yintercept = -1, linetype = 2, color = "black", linewidth = .6)+
+  geom_hline(yintercept = 3, linetype = 2, color = "red", linewidth = .6)+
+  geom_hline(yintercept = -3, linetype = 2, color = "red", linewidth = .6)+
+  labs(x= "Mean of normalized count (Log10)",
+       y= "Log2 Fold Change",
+       colour= "Genes",
+       title = "MA Plot - siC8 vs siLuc")+
+  scale_colour_manual(values = c("TRUE"="darkred",
+                                 "FALSE"="lightgray"),
+                      labels = c("TRUE"="Degs",
+                                 "FALSE"="Not significant"))+
+  geom_text_repel(aes(x = log10(baseMean), 
+                      y = log2FoldChange,
+                      label = ifelse(log2FoldChange > 2.7 | log2FoldChange < -2.7,
+                                     Gene.name,
+                                     "")),
+                  size = 3,
+                  max.overlaps = 40,
+                  colour = "navy",
+                  point.padding = 0.5, force = 3)+
+  guides(colour = "none")+
+  scale_y_continuous(breaks = c(-3,-1,1,3,5),limits = c(-5,6))+
+  My_theme()
+```
+
+-  Volcano plot
+
+```{r ,fig.width=8, fig.height=7}
+genes <- res_filt %>% 
+  dplyr::filter(padj < 1e-4) %>% 
+  dplyr::pull(Gene.name)
+
+My_violin(df = res, 
+          x= "log2FoldChange", 
+          y= "padj", 
+          lab= "Gene.name",
+          label_genes= T,
+          point_size = 2,
+          lab_size= 3,
+          lab_max_overlap= 20,
+          lab_box.padding= 0.5,
+          lab_colour = "navy", 
+          lab_fill = "white", 
+          lab_force_pull = .5,
+          selected_genes= genes,
+          logFC_thresh= 1,
+          padj_thresh= 1e-4,
+          col_palette= NULL,
+          extend_xlim= 0.5)+
+  ylim(c(0,12))+
+  geom_hline(yintercept = -log10(5e-02), linetype = 2, color = "red", linewidth = .4)
+```
+
+
+-   Heatmap :
+
+```{r ,fig.width=8, fig.height=8}
+res_filt <- res_filt %>% column_to_rownames(var = "ID")
+
+My_heatmap(counts_table = raw_filt, 
+           DEA_results = res_filt,
+           log_transform = T, 
+           list_genes = NULL, 
+           logFC_col = "log2FoldChange", 
+           pval_col = "padj", 
+           genes_col = "Gene.name",
+           cond1 = "siCTSB",
+           cond2 = "siLuc")
+```
+
+
+```{css, echo=FALSE}
+
+.scroll-100 {
+  max-height: 250px;
+  overflow-y: auto;
+  overflow-x: auto;
+  background-color: inherit;
+  color: darkred;
+  font-weight:600
+}
+
+.scroll-100-2 {
+  max-height: 250px;
+  overflow-y: auto;
+  overflow-x: auto;
+  background-color: inherit;
+  color: darkgreen;
+  font-weight:600
+}
+
+.scroll-100-3 {
+  max-height: 500px;
+  max-width: 1000px;
+  overflow-y: auto;
+  overflow-x: auto;
+  background-color: inherit;
+  color: midnightblue;
+  font-weight:600;
+  font-size:100%
+}
+
+```
+
+- Up regulated genes:
+
+```{r ,class.output="scroll-100"}
+AllResults %>% 
+  dplyr::filter(padj < 0.05, 
+                log2FoldChange > 1) %>% 
+  dplyr::pull(Gene.name) -> UpGenes ; UpGenes
+```
+
+- Down regulated genes:
+
+```{r ,class.output="scroll-100-2"}
+AllResults %>% 
+  dplyr::filter(padj < 0.05, 
+                log2FoldChange < -1) %>% 
+  dplyr::pull(Gene.name) -> DownGenes ; DownGenes
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PE Analysis
+
+```{r}
+AllResults %>% 
+  dplyr::filter(padj < 0.05, 
+                abs(log2FoldChange) > 1) %>%
+  dplyr::arrange(log2FoldChange) %>% 
+  dplyr::select(Gene.name, log2FoldChange) -> fc
+
+fc <- setNames(fc$log2FoldChange, fc$Gene.name)
+```
+
+
+
+
+## GO   {.tabset .tabset-fade}
+
+```{r}
+en.go <- enrichGO(gene = names(fc),
+                  OrgDb = "org.Hs.eg.db",
+                  keyType = "SYMBOL",
+                  minGSSize = 10,
+                  maxGSSize = 1000,
+                  readable = T,
+                  ont = "BP")
+```
+
+```{r}
+saveRDS(en.go, file = paste0(out_obj,"GOobj.rds"))
+```
+
+
+
+### Result  {.unlisted .unnumbered}
+
+```{r}
+go_res <- en.go@result %>% 
+  dplyr::filter(p.adjust < 0.05) %>% 
+      dplyr::mutate(RichFactor = round(Count / as.numeric(sub("/\\d+","",BgRatio)),5),
+                    BgGenes = as.numeric(sub("/\\d+","",BgRatio))) %>% 
+      dplyr::select(Description, RichFactor, p.adjust, GeneRatio, BgRatio, Count, BgGenes, geneID) %>% 
+  dplyr::arrange(p.adjust)
+
+go_res %>% 
+  dplyr::select(-geneID) %>% 
+  datatable(options = list(pageLength = 10, scrollX = T))
+```
+
+
+### Dot plot  {.unlisted .unnumbered}
+
+```{r ,fig.height=9, fig.width=10}
+go_res %>% 
+  head(30) %>% 
+      dplyr::mutate(Description = ifelse(nchar(Description) <= 60,
+                                         Description,
+                                         paste0(substr(Description,1,56), "...."))) %>% 
+      ggplot(aes(x= RichFactor, y= fct_reorder(Description, RichFactor)))+
+      geom_segment(aes(xend= 0, yend= Description))+
+      geom_point(aes(color= p.adjust, size= Count))+
+      scale_color_viridis_c(guide = guide_colorbar(reverse = T))+
+      scale_size_continuous(range = c(3,10))+
+      theme_linedraw()+
+      theme(panel.grid = element_blank(),
+            panel.border = element_blank(),
+            plot.title = element_text(size = 18, face = "bold", hjust = 0.5, colour = "darkred", 
+                                      margin = margin(b=0.2, unit = "in")),
+            plot.margin = unit(c(0.1,0.1,0.1,0.1), "in"),
+            axis.title.x = element_text(size = 16, face = "bold", colour = "darkred", 
+                                        margin = margin(t=0.2, unit = "in")),
+            axis.title.y = element_blank(),
+            axis.text = element_text(size = 14, face = "bold"),
+            legend.title = element_text(size = 15, face = "bold", colour = "darkred",
+                                        margin = margin(b=0.2, unit = "in")),
+            legend.text = element_text(size = 13),
+            legend.box.margin = margin(l=0.2, unit = "in"))+
+      labs(title = "GO Enriched Terms")
+```
+
+### Emapplot  {.unlisted .unnumbered}
+
+```{r ,fig.width=9, fig.height=9}
+en.go <- pairwise_termsim(en.go)
+
+enrichplot::emapplot(en.go,
+                         showCategory = 40,
+                         repel = T,
+                         edge.params = list(show = T, min = 0.3),
+                         cex.params = list(category_node = 1.1, 
+                                           category_label = 1, 
+                                           line = 0.4,
+                                           label_group = 1),
+                         cluster.params = list(cluster = F, 
+                                               method = stats::kmeans, 
+                                               n = 3, 
+                                               legend = F, 
+                                               label_style = "shadowtext", 
+                                               label_words_n = 3, 
+                                               label_format = 30),
+                         layout.params = list(layout = "kk"),
+                         node_label = "category")+
+      theme(legend.box.margin = margin(l=0.2, unit = "in"),
+            plot.margin = margin(t= 0.1, b=0.1, unit = "in"),
+            legend.title = element_text(face = "bold", 
+                                        colour = "darkred",
+                                        size = 14,
+                                        margin = margin(b=0.3, unit = "in")))+
+      scale_fill_gradientn(colours = c("darkred","gold"),
+                           values = c(0,1),
+                           limits = c(0, 0.05))+
+      labs(fill= "p.adjust")
+```
+
+
+## {.unlisted .unnumbered}
+
+```{r ,class.output="scroll-100-3"}
+go_res %>% dplyr::pull(Description) %>% cat(sep = "\n")
+```
+
+
+
+
+## GSEA  {.tabset .tabset-fade}
+
+```{r}
+
+r <- setNames(AllResults$Rank, AllResults$ENSEMBL)
+
+gsea.obj <- gseGO(geneList  = r,
+                  OrgDb = org.Hs.eg.db,
+                  ont = "BP",
+                  keyType = "ENSEMBL",
+                  minGSSize = 10,
+                  maxGSSize = 1000,
+                  pvalueCutoff = 0.05,
+                  verbose  = FALSE,
+                  nPermSimple = 10000) %>% 
+            setReadable(OrgDb = 'org.Hs.eg.db', keyType = "ENSEMBL")
+```
+
+```{r}
+saveRDS(gsea.obj, file = paste0(out_obj,"GSEAobj.rds"))
+```
+
+
+### Result  {.unlisted .unnumbered}
+
+```{r}
+gsea.result <- gsea.obj@result %>% 
+  dplyr::select(Description, setSize, NES, p.adjust, rank)
+
+gsea.result %>% datatable(options = list(pageLength = 5, scrollX = TRUE))
+```
+
+
+### Dot plot   {.unlisted .unnumbered}
+
+```{r ,fig.height=6, fig.width=8}
+
+dotplot(gsea.obj, 
+            showCategory=15, 
+            color = "p.adjust", 
+            x="NES")+
+      scale_size_continuous(range = c(3,8))+
+      theme(axis.text = element_text(face = "bold"),
+            axis.title = element_text(size = 12, face = "bold", colour = "darkred"))
+```
+
+
+
+### Gsea plot   {.unlisted .unnumbered}
+
+```{r}
+gseaplot2(gsea.obj, 
+          geneSetID = rownames(gsea.result)[1:4], 
+          color = MyPalette[1:4], 
+          pvalue_table = F, 
+          subplots = 1:2, base_size = 13, rel_heights = c(2,0.5,1))
+```
+
+```{r}
+gseaplot2(gsea.obj, 
+          geneSetID = rownames(gsea.result)[5:8], 
+          color = MyPalette[1:4], 
+          pvalue_table = F, 
+          subplots = 1:2, base_size = 13, rel_heights = c(2,0.5,1))
+```
+
+```{r}
+gseaplot2(gsea.obj, 
+          geneSetID = rownames(gsea.result)[9:10], 
+          color = MyPalette[2:3], 
+          pvalue_table = F, 
+          subplots = 1:2, base_size = 13, rel_heights = c(2,0.5,1))
+```
+
+
+## {.unlisted .unnumbered}
+
+```{r ,class.output="scroll-100-3"}
+gsea.result %>% dplyr::pull(Description)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
