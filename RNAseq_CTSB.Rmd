@@ -106,7 +106,8 @@ Pre_process <- function(RCounts,
                         Conditions,
                         keep_above = 40,
                         cpm_count_threshold = 0.5,
-                        apply_filt_samp = 4){
+                        apply_filt_samp = 4,
+                        pca_p.size = 5){
   
   rawcounts <- RCounts
   Experimental <- Conditions
@@ -137,7 +138,7 @@ Pre_process <- function(RCounts,
                       data = Experimental, 
                       colour = "Replicate",
                       shape = "Conditions",
-                      size = 5)+
+                      size = pca_p.size)+
     labs(title = "PCA")+
     My_theme()+
     geom_hline(yintercept = 0, linetype = 2, color = "gray", linewidth = .5)+
@@ -149,7 +150,8 @@ Pre_process <- function(RCounts,
   Outs <- list(raw_filt = raw_filt,
                dge = dge,
                MDS_plt = mds,
-               PCA_plt = pca_plt)
+               PCA_plt = pca_plt,
+               PCA_obj = pca)
   
   return(Outs)
 }
@@ -532,9 +534,9 @@ My_heatmap <- function(counts_table,
 ```{r ,include=FALSE, echo=FALSE, message=FALSE}
 
 if(params$c3m){
-  out_fig <- "~/Bureau/Projects/RNAseq/CTSB/out_fig/"
-  out_obj <- "~/Bureau/Projects/RNAseq/CTSB/out_obj/"
-  data_dir <- "~/Bureau/Projects/RNAseq/CTSB/data/"
+  out_fig <- "~/Bureau/Projects/RNAseq/RNAseq_CTSB/out_fig/"
+  out_obj <- "~/Bureau/Projects/RNAseq/RNAseq_CTSB/out_obj/"
+  data_dir <- "~/Bureau/Projects/RNAseq/RNAseq_CTSB/data/"
 } else {
   out_fig <- "/Projects/Project_M2_RNAseq/out_fig/"
   out_obj <- "/Projects/Project_M2_RNAseq/out_obj/"
@@ -716,10 +718,12 @@ AllResults <- res  %>%
                                  padj >= 5e-02 & padj < 0.5 ~ 
                                    round(log2FoldChange*(-log10(0.25))/20, 4),
                                  padj >= 0.25 ~ 0),
-                ENSEMBL = ID) %>% 
+                ENSEMBL = ID,
+                DEGs = case_when(padj < 0.05 & abs(log2FoldChange) > 1 ~ T,
+                                 TRUE ~ F)) %>% 
   column_to_rownames(var = "ID") %>%
   dplyr::arrange(desc(Rank)) %>%  
-  dplyr::select(ENSEMBL,Gene.name,baseMean,log2FoldChange,padj,Rank,Log_baseMean)
+  dplyr::select(ENSEMBL,Gene.name,baseMean,log2FoldChange,padj,Rank,DEGs,Log_baseMean)
 
 AllResults <- merge(AllResults, raw_filt, by = 0) %>% 
   column_to_rownames(var = "Row.names") %>% 
